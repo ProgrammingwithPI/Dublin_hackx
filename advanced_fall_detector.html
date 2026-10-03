@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Advanced Fall Detector</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800;900&display=swap" rel="stylesheet">
+    <!-- Leaflet CSS for Map -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            transition: background-color 0.2s ease, color 0.2s ease;
+        }
+        /* Custom map container sizing */
+        #map-container {
+            height: 350px;
+            width: 100%;
+            border-radius: 0.75rem;
+            overflow: hidden;
+            z-index: 10;
+        }
+        /* Pulse animation for the listening indicator */
+        @keyframes radar-pulse {
+            0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7); }
+            70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(34, 197, 94, 0); }
+            100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
+        }
+        .animate-radar {
+            animation: radar-pulse 2s infinite;
+        }
+    </style>
+</head>
+<body id="app-body" class="bg-gray-100 min-h-screen flex items-center justify-center p-4 text-gray-900">
+
+    <div id="dashboard" class="bg-white p-6 md:p-8 rounded-3xl shadow-2xl w-full max-w-2xl transition-all duration-300 border-4 border-transparent flex flex-col gap-6">
+        
+        <!-- Header & Alert Banner -->
+        <div class="text-center">
+            <h1 id="main-title" class="text-3xl md:text-4xl font-black uppercase tracking-wide text-gray-800">Fall Detector</h1>
+            <p id="sub-title" class="text-gray-500 mt-2 font-medium">Monitoring for high-frequency buzzer alerts...</p>
+            
+            <!-- Severity Indicator (Hidden initially) -->
+            <div id="severity-badge" class="hidden mt-4 inline-flex flex-col items-center justify-center py-2 px-6 rounded-xl bg-gray-100 border-2 border-gray-200">
+                <span class="text-xs font-bold text-gray-500 uppercase tracking-widest mb-1">Severity Level</span>
+                <span id="severity-text" class="text-2xl font-black text-gray-800">CALCULATING...</span>
+                <span id="pulse-rate" class="text-sm font-semibold text-gray-500 mt-1">0 beeps / 3 sec</span>
+            </div>
+        </div>
+
+        <!-- Map Section (Hidden until fall is detected) -->
+        <div id="map-section" class="hidden w-full bg-gray-50 rounded-2xl p-2 border-2 border-gray-200 shadow-inner relative">
+            <div id="map-container"></div>
+        </div>
+
+        <!-- Controls & Status -->
+        <div class="flex flex-col sm:flex-row items-center justify-between gap-4 bg-gray-50 p-4 rounded-2xl border border-gray-100">
+            <div class="flex items-center gap-3">
+                <div id="status-dot" class="w-5 h-5 rounded-full bg-gray-300 border-2 border-white shadow-sm"></div>
+                <span id="status-text" class="font-bold text-gray-600 tracking-wide">SYSTEM STANDBY</span>
+            </div>
+
+            <button id="btn-start" class="w-full sm:w-auto bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-8 rounded-xl shadow-lg hover:shadow-xl transition-all transform hover:-translate-y-0.5 active:translate-y-0 flex items-center justify-center">
+                Initialize System
+            </button>
+            <button id="btn-reset" class="hidden w-full sm:w-auto bg-red-100 hover:bg-red-200 text-red-700 font-black py-3 px-8 rounded-xl shadow-lg transition-all border border-red-300">
+                RESET ALERT
+            </button>
+        </div>
+
+        <!-- Hidden Audio Diagnostics (For Debug/System functionality) -->
+        <div class="hidden">
+            <div id="volume-bar" class="bg-blue-500 h-1" style="width: 0%"></div>
+        </div>
+        
+        <div id="error-message" class="text-red-500 text-sm text-center font-semibold hidden bg-red-50 p-3 rounded-lg border border-red-200">
+            Microphone or Location access denied. Please grant permissions.
+        </div>
+    </div>
+
+    <!-- Leaflet JS -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+
+    <script>
+        // DOM Elements
+        const body = document.getElementById('app-body');
+        const dashboard = document.getElementById('dashboard');
+        const mainTitle = document.getElementById('main-title');
+        const subTitle = document.getElementById('sub-title');
+        
+        const mapSection = document.getElementById('map-section');
+        const mapContainer = document.getElementById('map-container');
+        
+        const btnStart = document.getElementById('btn-start');
+        const btnReset = document.getElementById('btn-reset');
+        
+        const statusDot = document.getElementById('status-dot');
+        const statusText = document.getElementById('status-text');
+        const errorMessage = document.getElementById('error-message');
+        
+        const severityBadge = document.getElementById('severity-badge');
+        const severityText = document.getElementById('severity-text');
+        const pulseRateText = document.getElementById('pulse-rate');
+
+        // Audio & Logic Settings
+        const HARDCODED_THRESHOLD = 65; // Volume percentage to trigger a "beep"
+        const HYSTERESIS = 15; // Volume must drop by this amount to end a beep
+        const TIME_WINDOW_MS = 3000; // Track beeps over the last 3 seconds
+        
+        // System State
+        let audioContext = null;
+        let analyser = null;
+        let microphoneStream = null;
+        let animationFrameId = null;
+        
+        let isListening = false;
+        let isAlertActive = false;
+        
+        // Pulse tracking variables
+        let isCurrentlyLoud = false;
+        let beepTimestamps = [];
+        
+        // Map State
+        let map = null;
+        let marker = null;
+
+        function initMap(lat, lng) {
+            if (!map) {
+                // Initialize map
+                map = L.map('map-container').setView([lat, lng], 16);
+                
+                // Add OpenStreetMap tiles
+                L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                    maxZoom: 19,
+                    attribution: '© OpenStreetMap contributors'
+                }).addTo(map);
+                
+                // Custom red icon for alert
+                const alertIcon = L.icon({
+                    iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-red.png',
+                    shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/0.7.7/images/marker-shadow.png',
+                    iconSize: [25, 41],
+                    iconAnchor: [12, 41],
+                    popupAnchor: [1, -34],
+                    shadowSize: [41, 41]
+                });
+
+                // Add marker
+                marker = L.marker([lat, lng], {icon: alertIcon}).addTo(map)
+                    .bindPopup("<strong style='color:red;'>Fall Area</strong><br>Origin of alert.");
+            } else {
+                // Update existing map
+                map.setView([lat, lng], 16);
+                marker.setLatLng([lat, lng]);
+            }
+        }
+
+        async function fetchLocation() {
+            return new Promise((resolve, reject) => {
+                if (!navigator.geolocation) {
+                    reject(new Error("Geolocation is not supported by your browser"));
+                    return;
+                }
+                navigator.geolocation.getCurrentPosition(
+                    (position) => resolve({ lat: position.coords.latitude, lng: position.coords.longitude }),
+                    (error) => reject(error),
+                    { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 }
+                );
+            });
+        }
+
+        async function startSystem() {
+            try {
+                // Hide errors
+                errorMessage.classList.add('hidden');
+                btnStart.innerHTML = `<svg class="animate-spin -ml-1 mr-3 h-5 w-5 text-white inline" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg> Initializing...`;
+
+                // 1. Get Location (Initializes map in the background, but container stays hidden)
+                try {
+                    const coords = await fetchLocation();
+                    initMap(coords.lat, coords.lng);
+                } catch (locErr) {
+                    console.warn("Location failed, proceeding with audio only:", locErr);
+                }
+
+                // 2. Request Audio Access
+                microphoneStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+                
+                const AudioContext = window.AudioContext || window.webkitAudioContext;
+                audioContext = new AudioContext();
+                
+                analyser = audioContext.createAnalyser();
+                analyser.fftSize = 512; 
+                analyser.smoothingTimeConstant = 0.2; // Fast response for sudden buzzes
+                
+                const microphoneNode = audioContext.createMediaStreamSource(microphoneStream);
+                microphoneNode.connect(analyser);
+                
+                // Update UI State
+                isListening = true;
+                btnStart.classList.add('hidden');
+                
+                statusDot.className = 'w-5 h-5 rounded-full bg-green-500 animate-radar border-2 border-white shadow-sm';
+                statusText.textContent = 'MONITORING ACTIVE';
+                statusText.className = 'font-bold text-green-600 tracking-wide';
+                
+                // Reset metrics
+                beepTimestamps = [];
+                isCurrentlyLoud = false;
+
+                // Start loop
+                processAudio();
+                
+            } catch (err) {
+                console.error('System initialization error:', err);
+                errorMessage.textContent = "Microphone access denied or unavailable. Please grant permissions.";
+                errorMessage.classList.remove('hidden');
+                btnStart.innerHTML = 'Initialize System';
+            }
+        }
+
+        function processAudio() {
+            if (!isListening) return;
+
+            const bufferLength = analyser.frequencyBinCount;
+            const dataArray = new Uint8Array(bufferLength);
+            analyser.getByteTimeDomainData(dataArray);
+            
+            // Calculate peak volume
+            let maxPeak = 0;
+            for (let i = 0; i < bufferLength; i++) {
+                let deviation = Math.abs(dataArray[i] - 128);
+                if (deviation > maxPeak) {
+                    maxPeak = deviation;
+                }
+            }
+
+            const volumePercent = Math.min(100, Math.round((maxPeak / 128) * 100));
+            const now = Date.now();
+
+            // Edge Detection: Sound crossed above threshold
+            if (volumePercent >= HARDCODED_THRESHOLD && !isCurrentlyLoud) {
+                isCurrentlyLoud = true;
+                beepTimestamps.push(now);
+                
+                // Trigger alert UI on the very first beep
+                if (!isAlertActive) {
+                    triggerAlertUI();
+                }
+            } 
+            // Edge Detection: Sound dropped below threshold (with hysteresis to avoid stutter)
+            else if (volumePercent < (HARDCODED_THRESHOLD - HYSTERESIS)) {
+                isCurrentlyLoud = false;
+            }
+
+            // Cleanup old beeps outside our sliding window (3 seconds)
+            beepTimestamps = beepTimestamps.filter(timestamp => now - timestamp <= TIME_WINDOW_MS);
+
+            // Continuously evaluate severity if alert is active
+            if (isAlertActive) {
+                evaluateSeverity(beepTimestamps.length);
+            }
+
+            animationFrameId = requestAnimationFrame(processAudio);
+        }
+
+        function triggerAlertUI() {
+            isAlertActive = true;
+            
+            // Turn background bold red
+            body.classList.remove('bg-gray-100', 'text-gray-900');
+            body.classList.add('bg-red-600', 'text-white');
+            
+            // Dashboard styling changes
+            dashboard.classList.remove('border-transparent');
+            dashboard.classList.add('border-red-500', 'bg-white/95', 'backdrop-blur-md');
+            
+            // Header changes
+            mainTitle.textContent = 'FALL DETECTED';
+            mainTitle.classList.remove('text-gray-800');
+            mainTitle.classList.add('text-red-700', 'text-5xl', 'md:text-6xl');
+            
+            subTitle.textContent = 'A fall has been detected.';
+            subTitle.classList.remove('text-gray-500');
+            subTitle.classList.add('text-red-500', 'font-bold');
+
+            // Show reset button & severity badge
+            btnReset.classList.remove('hidden');
+            severityBadge.classList.remove('hidden');
+            severityBadge.classList.add('flex');
+            
+            // Reveal Map Section
+            mapSection.classList.remove('hidden');
+            if (map) {
+                // Open popup and invalidate size to ensure Leaflet renders correctly after being hidden
+                marker.openPopup();
+                setTimeout(() => map.invalidateSize(), 100);
+            }
+
+            // Update status
+            statusDot.className = 'w-5 h-5 rounded-full bg-red-600 border-2 border-white animate-pulse';
+            statusText.textContent = 'ALERT TRIGGERED';
+            statusText.className = 'font-bold text-red-600 tracking-wide';
+        }
+
+        function evaluateSeverity(pulseCount) {
+            pulseRateText.textContent = `${pulseCount} pulses / 3 sec`;
+            
+            // Reset classes
+            severityBadge.className = 'mt-4 inline-flex flex-col items-center justify-center py-3 px-8 rounded-xl border-4 transition-colors duration-200';
+            
+            if (pulseCount < 3) {
+                // Low severity: Slow pulsing or a single loud bang
+                severityText.textContent = 'LOW';
+                severityText.className = 'text-3xl font-black text-yellow-600';
+                severityBadge.classList.add('bg-yellow-50', 'border-yellow-400');
+            } else if (pulseCount >= 3 && pulseCount <= 6) {
+                // Medium severity: Moderate buzzing
+                severityText.textContent = 'MEDIUM';
+                severityText.className = 'text-3xl font-black text-orange-600';
+                severityBadge.classList.add('bg-orange-50', 'border-orange-500');
+            } else {
+                // High severity: Rapid, continuous buzzing (>2Hz)
+                severityText.textContent = 'HIGH';
+                severityText.className = 'text-3xl font-black text-red-700';
+                severityBadge.classList.add('bg-red-100', 'border-red-600', 'animate-pulse');
+            }
+        }
+
+        function resetSystem() {
+            isAlertActive = false;
+            beepTimestamps = [];
+            isCurrentlyLoud = false;
+            
+            // Restore UI Backgrounds
+            body.classList.remove('bg-red-600', 'text-white');
+            body.classList.add('bg-gray-100', 'text-gray-900');
+            
+            dashboard.classList.remove('border-red-500', 'bg-white/95', 'backdrop-blur-md');
+            dashboard.classList.add('border-transparent');
+            
+            // Restore Header
+            mainTitle.textContent = 'Fall Detector';
+            mainTitle.classList.remove('text-red-700', 'text-5xl', 'md:text-6xl');
+            mainTitle.classList.add('text-gray-800');
+            
+            subTitle.textContent = 'Monitoring for high-frequency buzzer alerts...';
+            subTitle.classList.remove('text-red-500', 'font-bold');
+            subTitle.classList.add('text-gray-500');
+
+            // Hide/Reset components
+            btnReset.classList.add('hidden');
+            severityBadge.classList.add('hidden');
+            severityBadge.classList.remove('flex');
+            
+            // Hide Map Section Again
+            mapSection.classList.add('hidden');
+            if (map) {
+                marker.closePopup();
+            }
+            
+            severityText.textContent = 'CALCULATING...';
+            
+            // Reset status
+            statusDot.className = 'w-5 h-5 rounded-full bg-green-500 animate-radar border-2 border-white shadow-sm';
+            statusText.textContent = 'MONITORING ACTIVE';
+            statusText.className = 'font-bold text-green-600 tracking-wide';
+        }
+
+        // Attach Listeners
+        btnStart.addEventListener('click', startSystem);
+        btnReset.addEventListener('click', resetSystem);
+
+    </script>
+</body>
+</html>
